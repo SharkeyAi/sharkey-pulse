@@ -1,0 +1,10 @@
+name: Sharkey Pulse
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire Alert
+        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
