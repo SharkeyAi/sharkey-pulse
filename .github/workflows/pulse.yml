@@ -1,12 +1,13 @@
 name: Sharkey Pulse
 on:
+  workflow_dispatch:
   schedule:
     - cron: '*/15 * * * *'
     - cron: '0 11 * * *'
     - cron: '0 3 * * *'
 jobs:
   alert:
-    if: github.event.schedule == '*/15 * * * *'
+    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Alert
