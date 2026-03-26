@@ -2,24 +2,24 @@ name: Sharkey Pulse
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'
-    - cron: '0 11 * * *'
-    - cron: '0 3 * * *'
+    - cron: '0,15,30,45 * * * *'
+    - cron: '0 9 * * *'
+    - cron: '0 1 * * *'
 jobs:
   alert:
-    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '0,15,30,45 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Alert
         run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
   briefing:
-    if: github.event.schedule == '0 11 * * *'
+    if: github.event.schedule == '0 9 * * *'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Briefing
         run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=briefing"
   recap:
-    if: github.event.schedule == '0 3 * * *'
+    if: github.event.schedule == '0 1 * * *'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Recap
