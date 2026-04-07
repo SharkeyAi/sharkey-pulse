@@ -4,10 +4,13 @@ on:
   schedule:
     - cron: '0,30 15-23,0-3 * * *'
     - cron: '0 9 * * *'
+    - cron: '0 18 * * *'
+    - cron: '0 1 * * *'
+    - cron: '0 2 * * *'
     - cron: '0 3 * * *'
 jobs:
   alert:
-    if: github.event.schedule == '0,15,30,45 * * * *' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '0,30 15-23,0-3 * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Alert
@@ -18,8 +21,26 @@ jobs:
     steps:
       - name: Fire Briefing
         run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=briefing"
-  recap:
+  midday:
+    if: github.event.schedule == '0 18 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire Midday
+        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
+  preclose:
     if: github.event.schedule == '0 1 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire Pre-Close
+        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
+  closewindow:
+    if: github.event.schedule == '0 2 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire Close Window
+        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
+  recap:
+    if: github.event.schedule == '0 3 * * *'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Recap
