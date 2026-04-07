@@ -1,47 +1,773 @@
-name: Sharkey Pulse
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0,30 15-23,0-3 * * *'
-    - cron: '0 9 * * *'
-    - cron: '0 18 * * *'
-    - cron: '0 1 * * *'
-    - cron: '0 2 * * *'
-    - cron: '0 3 * * *'
-jobs:
-  alert:
-    if: github.event.schedule == '0,30 15-23,0-3 * * *' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fire Alert
-        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
-  briefing:
-    if: github.event.schedule == '0 9 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fire Briefing
-        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=briefing"
-  midday:
-    if: github.event.schedule == '0 18 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fire Midday
-        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
-  preclose:
-    if: github.event.schedule == '0 1 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fire Pre-Close
-        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
-  closewindow:
-    if: github.event.schedule == '0 2 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fire Close Window
-        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
-  recap:
-    if: github.event.schedule == '0 3 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fire Recap
-        run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=recap"
+
+Copy
+
+// Sharkey Pulse — Agent Architecture v1
+// Learns each location over time, builds memory, detects patterns
+const PROJECT_ID = "gm-workbook";
+ 
+export default {
+  async scheduled(event, env, ctx) {
+    const now = new Date();
+    const hour = now.getUTCHours();
+    const minute = now.getUTCMinutes();
+    let type = "alert";
+    if (hour === 11 && minute < 15) type = "briefing";  // 6am EST
+    else if (hour === 3 && minute < 15) type = "recap";  // 10pm EST
+    const log = [];
+    ctx.waitUntil(runAgent(env, type, null, log));
+  },
+ 
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const type = url.searchParams.get("type") || "debug";
+    const rid  = url.searchParams.get("rid");
+    const log  = [];
+ 
+    if (type === "alert") {
+      const nowUTC = new Date();
+      const hourUTC = nowUTC.getUTCHours();
+      const inBusinessHours = hourUTC >= 15 || hourUTC < 4;
+      if (!inBusinessHours) {
+        return new Response("Outside business hours (" + hourUTC + " UTC) — no alert sent", { status: 200 });
+      }
+    }
+ 
+    if (type === "debug") {
+      const users = await fsGetCollection(env, "users");
+      const userList = Object.entries(users || {});
+      const target = userList.find(([, u]) => u.restaurantId === rid);
+      const month = new Date().getMonth();
+      let mData = null;
+      if (rid) {
+        for (let m = month; m >= 0; m--) {
+          mData = await fsGetDoc(env, `data/${rid}/months/${m}`);
+          if (mData && mData.weeks) break;
+        }
+      }
+      const memory = rid ? await fsGetDoc(env, `agent_memory/${rid}`) : null;
+      return new Response(JSON.stringify({
+        firestoreReachable: users !== null,
+        usersFound: userList.length,
+        targetRid: rid || "none",
+        gmFound: target ? { name: target[1].name, phone: target[1].phone||"NO PHONE" } : "not found",
+        monthDataFound: mData ? "yes" : "no",
+        memoryExists: memory ? "yes" : "no — will be created on first run",
+        memory: memory || {},
+        textbeltKey: env.TEXTBELT_KEY ? "set" : "MISSING",
+      }, null, 2), { headers: { "Content-Type": "application/json" } });
+    }
+ 
+    if (type === "memory") {
+      const memory = rid ? await fsGetDoc(env, `agent_memory/${rid}`) : null;
+      return new Response(JSON.stringify(memory || {}, null, 2), { headers: { "Content-Type": "application/json" } });
+    }
+ 
+    await runAgent(env, type, rid, log);
+    return new Response(log.join("\n"), { status: 200, headers: { "Content-Type": "text/plain" } });
+  }
+};
+ 
+// ── AGENT CORE ───────────────────────────────────────────────────────────────
+async function runAgent(env, type, filterRid, log) {
+  const l = log || [];
+  try {
+    const users = await fsGetCollection(env, "users");
+    const currentMonth = new Date().getMonth();
+    const today = new Date();
+    const todayKey = today.toISOString().split("T")[0];
+    const DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    const todayName = DAYS[today.getDay()];
+    const tomorrowName = DAYS[(today.getDay() + 1) % 7];
+ 
+    l.push(`Agent run: type=${type} date=${todayKey} day=${todayName}`);
+ 
+    for (const [, u] of Object.entries(users || {})) {
+      if (!u || u.status !== "approved" || u.role !== "gm" || !u.restaurantId) continue;
+      const rid = u.restaurantId;
+      if (filterRid && rid !== filterRid) continue;
+ 
+      l.push(`\n═══ ${u.restaurantName||rid} ═══`);
+      if (!u.phone) { l.push("SKIP: no phone"); continue; }
+ 
+      const primeTgt = await fsGetDoc(env, `settings/${rid}_primetarget`);
+      const target = primeTgt?.target || 55;
+      // Find most recent month with data
+      let mData = null;
+      for (let m = currentMonth; m >= 0; m--) {
+        mData = await fsGetDoc(env, `data/${rid}/months/${m}`);
+        if (mData && mData.weeks) break;
+      }
+      const [invoiceData, rosterData, vendorCmpData] = await Promise.all([
+        fsGetDoc(env, `ap/${rid}`),
+        fsGetDoc(env, `roster/${rid}`),
+        fsGetDoc(env, `vendorcmp/${rid}`),
+      ]);
+      const metrics = buildMetrics(mData, target);
+      if (!metrics || !metrics.mtdSales) { l.push("SKIP: no data"); continue; }
+ 
+      let memory = await fsGetDoc(env, `agent_memory/${rid}`) || {};
+ 
+      const invoiceContext = buildInvoiceContext(invoiceData);
+      const rosterContext = buildRosterContext(rosterData);
+      const priceContext = buildPriceContext(vendorCmpData, memory);
+      if (invoiceContext) l.push(`Invoices: ${invoiceContext.summary}`);
+      if (rosterContext) l.push(`Roster: ${rosterContext.summary}`);
+      if (priceContext) l.push(`Price intel: ${priceContext.summary}`);
+      l.push(`Memory: ${memory.runsTotal||0} runs, ${(memory.alertHistory||[]).length} alerts logged`);
+ 
+      const patterns = detectPatterns(metrics, memory, todayName);
+      l.push(`Patterns: ${patterns.join(" | ") || "none yet"}`);
+ 
+      // Build escalation counts per issue type from memory
+      const escalation = buildEscalationCounts(memory);
+      l.push(`Escalation: ${JSON.stringify(escalation)}`);
+ 
+      const agentContext = buildAgentContext(metrics, memory, patterns, target, u.restaurantName||rid, todayName, tomorrowName, type, invoiceContext, rosterContext, priceContext, escalation);
+ 
+      let shouldSend = false;
+      if (type === "briefing" || type === "recap") {
+        shouldSend = true;
+      } else {
+        const hasIssues = agentContext.alerts.length > 0 || agentContext.patternAlerts.length > 0;
+        if (hasIssues) {
+          const sentMessages = (memory.messageHistory||[]).filter(m => m.type === "alert");
+          const lastSent = sentMessages[sentMessages.length-1];
+          if (!lastSent || !lastSent.sentAt) {
+            shouldSend = true;
+            l.push("No recent alert sent — sending");
+          } else {
+            const minsSinceLast = (Date.now() - new Date(lastSent.sentAt).getTime()) / 60000;
+            if (minsSinceLast >= 30) {
+              shouldSend = true;
+              l.push(`${minsSinceLast.toFixed(0)} mins since last alert sent — sending`);
+            } else {
+              l.push(`Only ${minsSinceLast.toFixed(0)} mins since last alert sent — skipping`);
+            }
+          }
+        }
+      }
+ 
+      if (!shouldSend) { l.push(`No issues or within 30min window — silent`); }
+ 
+      let message = null;
+      if (shouldSend) {
+        const prompt = buildAgentPrompt(agentContext, type);
+        l.push(`Prompt context: ${prompt.slice(0,200)}...`);
+        message = await callSharkey(env, prompt);
+        l.push(`Message: ${message}`);
+      }
+ 
+      const updatedMemory = updateMemory(memory, metrics, patterns, agentContext, message, type, todayKey, todayName);
+      await fsSet(env, `agent_memory/${rid}`, updatedMemory);
+      l.push(`Memory updated: runs=${updatedMemory.runsTotal}`);
+ 
+      if (message) {
+        const sms = `[${u.restaurantName}] ${message}`;
+        const tbData = await sendSMS(env, u.phone, sms);
+        l.push(`SMS: success=${tbData.success} quota=${tbData.quota||""} provider=${tbData.provider||""}`);
+ 
+        const logKey = "msg_" + Date.now();
+        await fsSet(env, "pulse_log/all", { [logKey]: { type, location: u.restaurantName||rid, to: u.phone, message, timestamp: new Date().toISOString(), success: tbData.success } }).catch(()=>{});
+ 
+        const notifSettings = await fsGetDoc(env, `settings/${rid}_notifications`);
+        const contacts = (notifSettings?.contacts || []);
+        l.push(`Notifications: found ${contacts.length} contacts for type=${type}`);
+        for (const contact of contacts) {
+          l.push(`Contact: ${contact.name} phone=${contact.phone} types=${JSON.stringify(contact.types)}`);
+          if (contact.phone && (contact.types||[]).includes(type)) {
+            const phone = contact.phone.replace(/\D/g,"");
+            if (phone.length >= 10) {
+              const notifResult = await sendSMS(env, phone, sms);
+              const notifLogKey = "msg_" + Date.now() + "_" + Math.random().toString(36).slice(2,6);
+              await fsSet(env, "pulse_log/all", { [notifLogKey]: { type, location: u.restaurantName||rid, to: phone, message, timestamp: new Date().toISOString(), success: notifResult.success, recipient: contact.name, provider: notifResult.provider||"" } }).catch(()=>{});
+              l.push(`Notification sent to ${contact.name} success=${notifResult.success}`);
+            }
+          }
+        }
+ 
+        const notif = await fsGetDoc(env, `settings/${rid}_notifications`);
+        if (notif?.ownerAlerts && notif?.ownerPhone) {
+          await sendSMS(env, notif.ownerPhone, sms);
+          l.push("Owner copy sent");
+        }
+      }
+    }
+  } catch(e) {
+    l.push(`EXCEPTION: ${e.message}\n${e.stack||""}`);
+  }
+}
+ 
+// ── ESCALATION COUNTER ───────────────────────────────────────────────────────
+function buildEscalationCounts(memory) {
+  const alertHistory = memory.alertHistory || [];
+  const recent = alertHistory.slice(-20); // last 20 alert events
+  const counts = {};
+  recent.forEach(a => {
+    if (!counts[a.type]) counts[a.type] = 0;
+    counts[a.type]++;
+  });
+  return counts;
+}
+ 
+// ── METRICS ──────────────────────────────────────────────────────────────────
+function buildMetrics(mData, target) {
+  if (!mData || !mData.weeks) return null;
+  const weeks = mData.weeks;
+  const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+  const allWks = Object.keys(weeks).map(Number).sort((a,b)=>a-b);
+ 
+  let mtdSales=0, mtdLabor=0, mtdCovers=0, mtdPur=0;
+  const weeklyData = [];
+  const dailyData = {};
+ 
+  allWks.forEach(w => {
+    const wk = weeks[w]||{};
+    let wSales=0, wLabor=0, wCovers=0, wPur=0;
+    const wDays = {};
+    Object.entries(wk).forEach(([d,v]) => {
+      if (typeof v !== "object") return;
+      const s = (parseFloat(v.lunchSales)||0)+(parseFloat(v.dinnerSales)||0);
+      const lb = parseFloat(v.hourlyLaborDollar)||0;
+      const cv = (parseFloat(v.lunchCovers)||0)+(parseFloat(v.dinnerCovers)||0);
+      const p = parseFloat(v.purchases)||0;
+      wSales+=s; wLabor+=lb; wCovers+=cv; wPur+=p;
+      mtdSales+=s; mtdLabor+=lb; mtdCovers+=cv; mtdPur+=p;
+      const dayName = DAYS[parseInt(d)]||d;
+      wDays[dayName] = { sales:s, labor:lb, covers:cv,
+        laborPct: s>0?(lb/s*100):null,
+        checkAvg: cv>0?(s/cv):null };
+      if (!dailyData[dayName]) dailyData[dayName] = [];
+      if (s > 0) dailyData[dayName].push(s);
+    });
+    weeklyData.push({ week:w, sales:wSales, labor:wLabor, covers:wCovers, purchases:wPur,
+      laborPct: wSales>0?(wLabor/wSales*100):null, days:wDays });
+  });
+ 
+  const w0 = weeks[0]||{};
+  const beg = parseFloat((w0[6]&&w0[6].begInv)||0);
+  const lastWk = allWks[allWks.length-1];
+  const lastDay = (weeks[lastWk]||{})[6]||{};
+  const eow = parseFloat(lastDay.eowInv||0);
+  const foodCost = beg+mtdPur-eow;
+  const primeCost = mtdLabor+(foodCost>0?foodCost:0);
+ 
+  const dayAvgs = {};
+  Object.entries(dailyData).forEach(([day, vals]) => {
+    dayAvgs[day] = vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : 0;
+  });
+ 
+  const sortedDays = Object.entries(dayAvgs).sort((a,b)=>a[1]-b[1]);
+  const slowestDay = sortedDays[0]?.[0];
+  const busiestDay = sortedDays[sortedDays.length-1]?.[0];
+ 
+  const currentWeek = weeklyData[weeklyData.length-1];
+  const prevWeek = weeklyData.length>=2 ? weeklyData[weeklyData.length-2] : null;
+  const wowSalesChg = prevWeek&&prevWeek.sales>0 ? ((currentWeek.sales-prevWeek.sales)/prevWeek.sales*100) : null;
+  const wowLaborChg = prevWeek&&prevWeek.laborPct&&currentWeek.laborPct ? (currentWeek.laborPct-prevWeek.laborPct) : null;
+ 
+  const foodTrend = weeklyData.map(w => w.purchases>0&&w.sales>0 ? w.purchases/w.sales*100 : null).filter(Boolean);
+ 
+  // Today's actual numbers if available (last day in most recent week)
+  const lastWeekDays = currentWeek?.days || {};
+  const todayDayNames = Object.keys(lastWeekDays);
+  const mostRecentDay = todayDayNames[todayDayNames.length-1];
+  const todayData = mostRecentDay ? lastWeekDays[mostRecentDay] : null;
+ 
+  return {
+    mtdSales, mtdLabor, mtdCovers, mtdPur, weeklyData, dailyData, dayAvgs,
+    slowestDay, busiestDay, currentWeek, prevWeek,
+    wowSalesChg, wowLaborChg, foodTrend,
+    todayData, mostRecentDay,
+    mtdLaborPct: mtdSales>0?(mtdLabor/mtdSales*100):null,
+    mtdFoodPct: mtdSales>0&&foodCost>0?(foodCost/mtdSales*100):null,
+    mtdPrimePct: mtdSales>0&&primeCost>0?(primeCost/mtdSales*100):null,
+    mtdCheckAvg: mtdCovers>0?(mtdSales/mtdCovers):null,
+    weeksOfData: allWks.length,
+  };
+}
+ 
+// ── PATTERN DETECTION ────────────────────────────────────────────────────────
+function detectPatterns(metrics, memory, todayName) {
+  const patterns = [];
+ 
+  if (metrics.slowestDay === todayName) {
+    const avg = metrics.dayAvgs[todayName];
+    if (avg > 0) patterns.push(`${todayName} is historically your slowest day (avg $${Math.round(avg).toLocaleString()})`);
+  }
+ 
+  if (metrics.busiestDay === todayName) {
+    const avg = metrics.dayAvgs[todayName];
+    if (avg > 0) patterns.push(`${todayName} is your highest-volume day (avg $${Math.round(avg).toLocaleString()})`);
+  }
+ 
+  const ft = metrics.foodTrend;
+  if (ft.length >= 3 && ft[ft.length-1] > ft[ft.length-2] && ft[ft.length-2] > ft[ft.length-3]) {
+    patterns.push(`Food cost has risen 3 weeks in a row (${ft[ft.length-3].toFixed(1)}% → ${ft[ft.length-2].toFixed(1)}% → ${ft[ft.length-1].toFixed(1)}%)`);
+  }
+ 
+  if (metrics.wowSalesChg !== null && metrics.wowSalesChg < -10) {
+    patterns.push(`Sales down ${Math.abs(metrics.wowSalesChg).toFixed(1)}% vs last week`);
+  }
+ 
+  if (metrics.wowSalesChg !== null && metrics.wowSalesChg > 10) {
+    patterns.push(`Sales up ${metrics.wowSalesChg.toFixed(1)}% vs last week — strong momentum`);
+  }
+ 
+  if (metrics.wowLaborChg !== null && metrics.wowLaborChg > 2) {
+    patterns.push(`Labor % up ${metrics.wowLaborChg.toFixed(1)}pts week over week`);
+  }
+ 
+  const priorAlerts = memory.alertHistory || [];
+  const recentAlerts = priorAlerts.slice(-10);
+  const foodAlerts = recentAlerts.filter(a => a.type === "food_cost").length;
+  const laborAlerts = recentAlerts.filter(a => a.type === "labor").length;
+  const primeAlerts = recentAlerts.filter(a => a.type === "prime").length;
+  if (foodAlerts >= 3) patterns.push(`Food cost flagged ${foodAlerts} times in recent runs — persistent issue`);
+  if (laborAlerts >= 3) patterns.push(`Labor flagged ${laborAlerts} times in recent runs — staffing review needed`);
+  if (primeAlerts >= 3) patterns.push(`Prime cost flagged ${primeAlerts} consecutive times — needs management intervention`);
+ 
+  if (memory.avgCheckHistory && memory.avgCheckHistory.length >= 2) {
+    const hist = memory.avgCheckHistory;
+    const recent = hist[hist.length-1];
+    const older = hist[hist.length-2];
+    if (recent && older && recent < older * 0.95) {
+      patterns.push(`Check average dropped from $${older.toFixed(2)} to $${recent.toFixed(2)} — upsell opportunity`);
+    }
+  }
+ 
+  return patterns;
+}
+ 
+// ── AGENT CONTEXT ────────────────────────────────────────────────────────────
+function buildAgentContext(metrics, memory, patterns, target, name, todayName, tomorrowName, type, invoiceContext, rosterContext, priceContext, escalation) {
+  const alerts = [];
+  const patternAlerts = [];
+ 
+  if (metrics.mtdPrimePct && metrics.mtdPrimePct > target)
+    alerts.push({ type:"prime", msg:`Prime cost ${metrics.mtdPrimePct.toFixed(1)}% is ${(metrics.mtdPrimePct-target).toFixed(1)}pts above ${target}% target` });
+  if (metrics.mtdFoodPct && metrics.mtdFoodPct > target*0.55)
+    alerts.push({ type:"food_cost", msg:`Food cost ${metrics.mtdFoodPct.toFixed(1)}% running high` });
+  if (metrics.mtdLaborPct && metrics.mtdLaborPct > 25)
+    alerts.push({ type:"labor", msg:`Labor ${metrics.mtdLaborPct.toFixed(1)}% above 25% benchmark` });
+  if (metrics.wowSalesChg !== null && metrics.wowSalesChg < -10)
+    alerts.push({ type:"sales_drop", msg:`Sales down ${Math.abs(metrics.wowSalesChg).toFixed(1)}% vs last week` });
+ 
+  patterns.forEach(p => patternAlerts.push(p));
+ 
+  // Tomorrow historical context
+  const tomorrowAvg = metrics.dayAvgs?.[tomorrowName];
+  const tomorrowIsSlowest = metrics.slowestDay === tomorrowName;
+  const tomorrowIsBusiest = metrics.busiestDay === tomorrowName;
+ 
+  return {
+    name, target, todayName, tomorrowName, alerts, patternAlerts,
+    escalation: escalation || {},
+    mtd: {
+      sales: metrics.mtdSales,
+      laborPct: metrics.mtdLaborPct,
+      foodPct: metrics.mtdFoodPct,
+      primePct: metrics.mtdPrimePct,
+      checkAvg: metrics.mtdCheckAvg,
+    },
+    today: metrics.todayData,
+    wow: {
+      salesChg: metrics.wowSalesChg,
+      laborChg: metrics.wowLaborChg,
+    },
+    tomorrow: {
+      name: tomorrowName,
+      avgSales: tomorrowAvg ? Math.round(tomorrowAvg) : null,
+      isSlowest: tomorrowIsSlowest,
+      isBusiest: tomorrowIsBusiest,
+    },
+    slowestDay: metrics.slowestDay,
+    busiestDay: metrics.busiestDay,
+    weeksLearned: metrics.weeksOfData,
+    runsTotal: memory.runsTotal || 0,
+    salesByDay: metrics.dayAvgs || {},
+    rosterContext,
+    invoiceContext,
+    priceContext,
+    memoryInsights: memory.keyInsights || [],
+  };
+}
+ 
+// ── AGENT PROMPT ─────────────────────────────────────────────────────────────
+function buildAgentPrompt(ctx, type) {
+  const m = ctx.mtd;
+  const esc = ctx.escalation || {};
+ 
+  function escLevel(issueType) {
+    const count = esc[issueType] || 0;
+    if (count === 0) return "first_time";
+    if (count <= 2) return "early";
+    if (count <= 5) return "recurring";
+    return "critical";
+  }
+ 
+  const primeLevel = escLevel("prime");
+  const foodLevel = escLevel("food_cost");
+  const laborLevel = escLevel("labor");
+ 
+  const tomorrowBlock = ctx.tomorrow.avgSales
+    ? `Tomorrow (${ctx.tomorrow.name}) historically averages $${ctx.tomorrow.avgSales.toLocaleString()} in sales.${ctx.tomorrow.isSlowest ? " This is their slowest day of the week." : ""}${ctx.tomorrow.isBusiest ? " This is their highest-volume day of the week." : ""}`
+    : `Tomorrow is ${ctx.tomorrow.name}.`;
+ 
+  // Calculate labor dollar gap
+  const laborGapDollars = m.sales && m.laborPct && ctx.target
+    ? Math.round(m.sales * (m.laborPct / 100) - m.sales * ((ctx.target * 0.45) / 100))
+    : null;
+ 
+  const dataBlock = [
+    `Location: ${ctx.name} | Prime cost target: ${ctx.target}% | Today: ${ctx.todayName}`,
+    `MTD Sales: $${Math.round(m.sales).toLocaleString()} | Labor: ${m.laborPct?.toFixed(1)||"?"}% | Food: ${m.foodPct?.toFixed(1)||"?"}% | Prime: ${m.primePct?.toFixed(1)||"?"}%`,
+    laborGapDollars ? `Labor dollar gap vs target: $${Math.abs(laborGapDollars)} ${laborGapDollars > 0 ? "OVER" : "under"}` : "",
+    m.checkAvg ? `Check Avg: $${m.checkAvg.toFixed(2)}` : "",
+    ctx.wow.salesChg !== null ? `Sales WoW: ${ctx.wow.salesChg>0?"+":""}${ctx.wow.salesChg.toFixed(1)}%` : "",
+    ctx.wow.laborChg !== null ? `Labor WoW: ${ctx.wow.laborChg>0?"+":""}${ctx.wow.laborChg.toFixed(1)}pts` : "",
+    ctx.slowestDay ? `Historically slowest day: ${ctx.slowestDay}` : "",
+    ctx.busiestDay ? `Historically busiest day: ${ctx.busiestDay}` : "",
+    tomorrowBlock,
+    ctx.alerts.length ? `COST ALERTS: ${ctx.alerts.map(a=>a.msg).join(" | ")}` : "Cost metrics on target",
+    ctx.patternAlerts.length ? `PATTERNS: ${ctx.patternAlerts.join(" | ")}` : "",
+    ctx.memoryInsights.length ? `PRIOR INSIGHTS: ${ctx.memoryInsights.slice(-3).join(" | ")}` : "",
+    ctx.rosterContext ? `Roster: ${ctx.rosterContext.detail}` : "",
+    ctx.invoiceContext ? `Invoices: ${ctx.invoiceContext.detail}` : "",
+    ctx.priceContext ? `Price intel: ${ctx.priceContext.detail}` : "",
+    `Escalation levels — prime: ${primeLevel} | food: ${foodLevel} | labor: ${laborLevel}`,
+    `Agent has been learning this location for ${ctx.weeksLearned} weeks (${ctx.runsTotal} runs)`,
+  ].filter(Boolean).join("\n");
+ 
+  const dmPersona = `You are Sharkey, an AI district manager who has run 50+ restaurants. You text the GM and owner daily with specific, dollar-based operational intelligence. You think like an operator, not a consultant.
+ 
+CORE OPERATING PHILOSOPHY:
+- Labor is always a DOLLAR amount, never just hours. Calculate the dollar gap first, then make a decision. 4 hours means nothing — $80 means something.
+- BOH (kitchen) runs at minimum crew. You almost never tell them to cut a cook or dishwasher mid-shift — that breaks the kitchen. BOH is untouchable unless you have clear evidence of excess.
+- The flex positions are HOST and TO-GO. Servers and managers can absorb both. Check to-go volume before cutting to-go. If to-go is slow, that's your first cut. If host tables are seating themselves, host goes home.
+- Servers make $2.13/hour in most states. Cutting a server saves almost nothing. Never lead with cutting a server.
+- Salaried managers cost the same whether they're in the office or on the floor. A manager stepping into a position can free up a higher-wage hourly — but managers can't be stuck on a station during service because they need to handle guest issues, void errors, vendor calls, and administrative needs. Use manager coverage only for short gaps in slow periods.
+- The biggest labor savings happen BEFORE the shift starts — staggering in-times, pushing start times back on slow days. By the time you're texting a mid-shift alert, some money is already spent.
+- Think in time windows: 6am = plan the day and stagger in-times. 1pm = plan for dinner, make calls now. 8pm = pre-close cut opportunities. 9pm = set close expectations. 10pm = full financial day wrap.
+- Food cost cannot be calculated truly daily — it requires weekly inventory. Use estimated food cost based on purchases vs sales as an approximation and be honest that it is an estimate.
+- Prime cost = food cost + labor. This is THE number. Everything else is context.
+ 
+TONE RULES:
+- Never say "Good morning" or "Good evening" — get straight to the numbers
+- Never use asterisks, bullet points, or emojis
+- Never say "consider" or "you might want to" — be direct
+- Never prescribe a specific staff cut without knowing the dollar impact
+- Always calculate: current labor % x sales = labor dollars. Target labor % x sales = where you need to be. The gap is what you need to cut in DOLLARS.
+- Sound like a DM who has seen everything — calm, direct, specific
+- Do NOT start with the location name — it is already prepended automatically
+ 
+Write ONLY the SMS body. No headers, no subject lines, no sign-offs.`;
+ 
+  const base = `${dmPersona}\n\nDATA:\n${dataBlock}\n\n`;
+ 
+  if (type === "briefing") {
+    return base + `Write the 6am morning briefing. This goes to both the GM and the owner. 3 sentences max.
+ 
+Sentence 1: Prime cost vs target with the actual number and gap. If escalation is "recurring" or "critical" open with urgency — this is not the first time.
+Sentence 2: The most important trend — WoW sales change, food cost direction, or labor movement. Use the specific number. If today is their historically slowest day, name it and what that means for staffing.
+Sentence 3: One specific action for today based on the primary issue. If food cost is the problem — work one on one with prep and line cooks on portions, check in the next delivery truck carefully, or weigh proteins during inventory. If labor is the problem — recommend staggering in-times based on today's historical volume. Never say "audit your waste log" or "watch food cost" — name the specific action.
+ 
+Escalation: first_time = informational. early = worth watching. recurring = this needs action today, name the specific action. critical = this has been a persistent failure, be direct and urgent.`;
+  }
+ 
+  if (type === "recap") {
+    return base + `Write the 10pm day recap. This goes to BOTH the GM and the owner — write it so both get value from the same message. 4 sentences max.
+ 
+Sentence 1: Sales for the day and how the month is tracking. Give the monthly number and what daily average they need to hit their goal.
+Sentence 2: Prime cost for the day vs target — actual number, actual gap, direct assessment of whether it was a good or bad day financially.
+Sentence 3: Labor and food cost direction this week — are they trending better or worse. Give the specific number and the dollar impact.
+Sentence 4: One specific action for tomorrow — stagger in-times based on ${tomorrowBlock}. What position can come in later, what does the BOH schedule look like, where is the dollar savings opportunity before tomorrow even starts.
+ 
+If escalation is "recurring" or "critical" on prime or food cost — the last sentence must address that problem specifically for tomorrow, not someday.`;
+  }
+ 
+  // Alert — determine time of day for context
+  const issueList = [...ctx.alerts.map(a=>a.msg), ...ctx.patternAlerts].join(" | ");
+  const worstIssue = ctx.alerts[0];
+  const worstLevel = worstIssue ? escLevel(worstIssue.type) : "early";
+ 
+  const hourUTC = new Date().getUTCHours();
+  const hourEST = (hourUTC - 5 + 24) % 24;
+  let timeWindow = "";
+  if (hourEST >= 5 && hourEST < 11) timeWindow = "morning — service is starting, focus on in-time staggering and prep decisions";
+  else if (hourEST >= 11 && hourEST < 14) timeWindow = "lunch rush — kitchen is at capacity, do not touch BOH";
+  else if (hourEST >= 14 && hourEST < 17) timeWindow = "post-lunch dead zone — this is the window to push dinner crew start times back and save dollars before dinner";
+  else if (hourEST >= 17 && hourEST < 20) timeWindow = "dinner service — kitchen is running, focus on FOH flex positions (host and to-go) if labor is high";
+  else if (hourEST >= 20 && hourEST < 22) timeWindow = "dinner winding down — pre-close cut window. Look at who can leave early. Think dollars not hours.";
+  else timeWindow = "late night close window — focus on close completion not new cuts";
+ 
+  return base + `ISSUES DETECTED: ${issueList}
+TIME OF DAY CONTEXT: ${timeWindow}
+ 
+Write a mid-shift alert. 2-3 sentences max.
+ 
+LABOR CALCULATION REQUIRED: If labor is the issue, calculate the dollar gap first:
+- Current labor % x MTD sales = current labor dollars
+- Target labor % x MTD sales = target labor dollars  
+- Gap = dollars over target
+Then recommend action based on that dollar gap and the time of day.
+ 
+FOOD COST ACTIONS — when food cost is the primary issue, staffing cuts are NOT the answer. Food cost is fixed through:
+1. Working one on one with prep and line cooks to ensure every item is portioned correctly and consistently — not just telling them, standing there with them and verifying it
+2. Checking in every delivery truck — receiving is where food cost bleeds. Product gets invoiced for 10 cases and 8 show up. Someone has to physically verify every item on every invoice against what actually came off the truck
+3. During weekly inventory — weigh everything that is sold by weight. A visual count of proteins means nothing. Every protein, every cheese, every item sold by weight gets physically weighed
+4. Accurate counts on everything during inventory — variance between theoretical and actual starts with sloppy inventory counts
+ 
+STAFFING HIERARCHY FOR CUTS — only use when labor is the primary issue:
+1. To-go position — if to-go volume is slow, a server absorbs it. Check volume first.
+2. Host — if tables are seating themselves, host goes home.
+3. A server — calculate the dollar savings first. Servers make $2.13/hr. Is that enough to move the needle?
+4. BOH — almost never mid-shift. Kitchen runs at minimum. Only cut if there is clear evidence of excess.
+5. Salaried manager covering a position — only for short gaps in slow periods. Manager must stay available for guest issues, voids, and admin needs.
+ 
+Escalation level: ${worstLevel}
+- first_time: inform, give the dollar number, suggest awareness
+- early: flag clearly, give dollar gap, name the action
+- recurring: direct, this is not the first time, name the specific food cost action from the list above
+- critical: urgent, name it as a persistent failure, give the dollar gap, assign the specific food cost action — portions, receiving, or inventory accuracy`;
+}
+ 
+// ── MEMORY UPDATE ─────────────────────────────────────────────────────────────
+function updateMemory(memory, metrics, patterns, ctx, message, type, todayKey, todayName) {
+  const now = new Date().toISOString();
+  const updated = { ...memory };
+ 
+  updated.runsTotal = (memory.runsTotal || 0) + 1;
+  updated.lastRun = now;
+  updated.lastRunType = type;
+ 
+  if (!updated.alertHistory) updated.alertHistory = [];
+  ctx.alerts.forEach(a => {
+    updated.alertHistory.push({ type: a.type, date: todayKey, day: todayName, timestamp: now });
+  });
+  updated.alertHistory = updated.alertHistory.slice(-50);
+ 
+  if (!updated.avgCheckHistory) updated.avgCheckHistory = [];
+  if (metrics.mtdCheckAvg) {
+    updated.avgCheckHistory.push(parseFloat(metrics.mtdCheckAvg.toFixed(2)));
+    updated.avgCheckHistory = updated.avgCheckHistory.slice(-12);
+  }
+ 
+  if (!updated.primeCostHistory) updated.primeCostHistory = [];
+  if (metrics.mtdPrimePct) {
+    updated.primeCostHistory.push({ date: todayKey, pct: parseFloat(metrics.mtdPrimePct.toFixed(2)) });
+    updated.primeCostHistory = updated.primeCostHistory.slice(-30);
+  }
+ 
+  if (!updated.salesByDay) updated.salesByDay = {};
+  Object.entries(metrics.dayAvgs || {}).forEach(([day, avg]) => {
+    updated.salesByDay[day] = parseFloat(avg.toFixed(2));
+  });
+ 
+  if (!updated.keyInsights) updated.keyInsights = [];
+  patterns.forEach(p => {
+    if (!updated.keyInsights.includes(p)) {
+      updated.keyInsights.push(p);
+    }
+  });
+  updated.keyInsights = updated.keyInsights.slice(-10);
+ 
+  updated.slowestDay = metrics.slowestDay;
+  updated.busiestDay = metrics.busiestDay;
+ 
+  if (!updated.messageHistory) updated.messageHistory = [];
+  if (message) {
+    updated.messageHistory.push({ type, date: todayKey, sentAt: now, message: message.slice(0, 100) });
+    updated.messageHistory = updated.messageHistory.slice(-20);
+  }
+ 
+  updated.lastMTDSnapshot = {
+    date: todayKey,
+    sales: Math.round(metrics.mtdSales),
+    laborPct: metrics.mtdLaborPct ? parseFloat(metrics.mtdLaborPct.toFixed(2)) : null,
+    foodPct: metrics.mtdFoodPct ? parseFloat(metrics.mtdFoodPct.toFixed(2)) : null,
+    primePct: metrics.mtdPrimePct ? parseFloat(metrics.mtdPrimePct.toFixed(2)) : null,
+  };
+ 
+  return updated;
+}
+ 
+// ── INVOICE CONTEXT ─────────────────────────────────────────────────────────
+function buildInvoiceContext(invoiceData) {
+  if (!invoiceData) return null;
+  const invoices = Object.values(invoiceData).filter(v => typeof v === "object" && v.vendor && v.amount);
+  if (!invoices.length) return null;
+ 
+  const sorted = invoices.sort((a,b) => new Date(b.date||0) - new Date(a.date||0)).slice(0, 20);
+  const total = sorted.reduce((s,i) => s+(parseFloat(i.amount)||0), 0);
+ 
+  const byVendor = {};
+  sorted.forEach(i => {
+    const v = i.vendor || "Unknown";
+    if (!byVendor[v]) byVendor[v] = 0;
+    byVendor[v] += parseFloat(i.amount)||0;
+  });
+ 
+  const topVendor = Object.entries(byVendor).sort((a,b)=>b[1]-a[1])[0];
+  const recent = sorted.slice(0,5);
+  const recentTotal = recent.reduce((s,i)=>s+(parseFloat(i.amount)||0),0);
+  const older = sorted.slice(5,10);
+  const olderTotal = older.reduce((s,i)=>s+(parseFloat(i.amount)||0),0);
+  const spike = olderTotal > 0 ? ((recentTotal-olderTotal)/olderTotal*100) : null;
+ 
+  const summary = `${invoices.length} invoices, $${Math.round(total).toLocaleString()} total. Top vendor: ${topVendor?.[0]||"N/A"} ($${Math.round(topVendor?.[1]||0).toLocaleString()})`;
+  const detail = spike !== null && Math.abs(spike) > 15
+    ? `${invoices.length} invoices logged. ${topVendor?.[0]} is top vendor at $${Math.round(topVendor?.[1]||0).toLocaleString()}. Invoice spend ${spike>0?"up":"down"} ${Math.abs(spike).toFixed(0)}% recently vs prior period.`
+    : `${invoices.length} invoices logged. Top vendor: ${topVendor?.[0]||"N/A"} $${Math.round(topVendor?.[1]||0).toLocaleString()}. Total $${Math.round(total).toLocaleString()}.`;
+ 
+  return { summary, detail, total, topVendor, spike, invoices: sorted };
+}
+ 
+// ── PRICE INTELLIGENCE ──────────────────────────────────────────────────────
+function buildPriceContext(vendorCmpData, memory) {
+  if (!vendorCmpData) return null;
+  const comparisons = Object.values(vendorCmpData).filter(v => typeof v === "object" && v.results);
+  if (!comparisons.length) return null;
+ 
+  const latest = comparisons.sort((a,b) => new Date(b.generatedAt||0) - new Date(a.generatedAt||0))[0];
+  if (!latest) return null;
+ 
+  const priorPrices = memory.priceSnapshot || {};
+  const drops = [];
+  const spikes = [];
+ 
+  if (latest.items && Array.isArray(latest.items)) {
+    latest.items.forEach(item => {
+      const prior = priorPrices[item.name];
+      if (prior && item.bestPrice) {
+        const chg = ((item.bestPrice - prior) / prior * 100);
+        if (chg < -5) drops.push(`${item.name} down ${Math.abs(chg).toFixed(0)}% ($${prior.toFixed(2)} → $${item.bestPrice.toFixed(2)})`);
+        if (chg > 10) spikes.push(`${item.name} up ${chg.toFixed(0)}% ($${prior.toFixed(2)} → $${item.bestPrice.toFixed(2)})`);
+      }
+    });
+  }
+ 
+  const totalSavings = latest.totalSavings || 0;
+  const vendors = (latest.vendors || []).join(", ");
+  const summary = `${comparisons.length} comparisons saved. Latest: ${vendors}. Savings identified: $${totalSavings.toFixed(2)}`;
+ 
+  let detail = `Vendor comparison: ${vendors}. $${totalSavings.toFixed(2)} in savings identified.`;
+  if (drops.length) detail += ` PRICE DROPS: ${drops.join(", ")} — opportunity to run specials.`;
+  if (spikes.length) detail += ` PRICE SPIKES: ${spikes.join(", ")} — review menu pricing.`;
+  if (!drops.length && !spikes.length) detail += " No significant price changes vs prior comparison.";
+ 
+  return { summary, detail, drops, spikes, totalSavings, vendors };
+}
+ 
+// ── ROSTER CONTEXT ───────────────────────────────────────────────────────────
+function buildRosterContext(rosterData) {
+  if (!rosterData) return null;
+  const staff = Object.entries(rosterData).filter(([,e]) => typeof e === "object" && e.status === "active");
+  if (!staff.length) return null;
+ 
+  const wages = staff.map(([,e]) => parseFloat(e.wage)||0).filter(w=>w>0);
+  const avgWage = wages.length ? wages.reduce((a,b)=>a+b,0)/wages.length : 0;
+  const highWage = staff.filter(([,e]) => parseFloat(e.wage) > avgWage * 1.2);
+  const byRole = {};
+  staff.forEach(([,e]) => {
+    const r = e.role||"Other";
+    if (!byRole[r]) byRole[r] = [];
+    byRole[r].push(e);
+  });
+ 
+  const highWageNames = highWage.slice(0,3).map(([,e])=>`${e.firstName} ${e.lastName} ($${e.wage}/hr)`).join(", ");
+  const summary = `${staff.length} active staff, avg wage $${avgWage.toFixed(2)}/hr`;
+  const detail = `${staff.length} active staff, avg $${avgWage.toFixed(2)}/hr. Roles: ${Object.entries(byRole).map(([r,s])=>`${s.length} ${r}`).join(", ")}.${highWage.length ? ` Above-avg wage earners: ${highWageNames}.` : ""}`;
+ 
+  return { summary, detail, count: staff.length, avgWage, highWage, byRole };
+}
+ 
+// ── FIRESTORE ────────────────────────────────────────────────────────────────
+function fsToObj(doc) {
+  if (!doc || !doc.fields) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(doc.fields)) {
+    if      (v.stringValue  !== undefined) out[k] = v.stringValue;
+    else if (v.integerValue !== undefined) out[k] = parseInt(v.integerValue);
+    else if (v.doubleValue  !== undefined) out[k] = parseFloat(v.doubleValue);
+    else if (v.booleanValue !== undefined) out[k] = v.booleanValue;
+    else if (v.mapValue     !== undefined) out[k] = fsToObj(v.mapValue);
+    else if (v.arrayValue   !== undefined) out[k] = (v.arrayValue.values||[]).map(i => {
+      if (i.mapValue) return fsToObj(i.mapValue);
+      if (i.stringValue !== undefined) return i.stringValue;
+      if (i.integerValue !== undefined) return parseInt(i.integerValue);
+      if (i.doubleValue !== undefined) return parseFloat(i.doubleValue);
+      if (i.booleanValue !== undefined) return i.booleanValue;
+      return null;
+    });
+    else out[k] = null;
+  }
+  return out;
+}
+ 
+function objToFs(obj) {
+  if (obj === null || obj === undefined) return { nullValue: null };
+  if (typeof obj === "string")  return { stringValue: obj };
+  if (typeof obj === "boolean") return { booleanValue: obj };
+  if (typeof obj === "number")  return Number.isInteger(obj) ? { integerValue: String(obj) } : { doubleValue: obj };
+  if (Array.isArray(obj))       return { arrayValue: { values: obj.map(objToFs) } };
+  if (typeof obj === "object")  return { mapValue: { fields: Object.fromEntries(Object.entries(obj).map(([k,v])=>[k,objToFs(v)])) } };
+  return { stringValue: String(obj) };
+}
+ 
+async function fsGetDoc(env, path) {
+  const res = await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${path}?key=${env.FIREBASE_API_KEY}`);
+  if (!res.ok) return null;
+  return fsToObj(await res.json());
+}
+ 
+async function fsGetCollection(env, collection) {
+  const res = await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${collection}?key=${env.FIREBASE_API_KEY}`);
+  if (!res.ok) return null;
+  const data = await res.json();
+  if (!data.documents) return {};
+  const out = {};
+  for (const doc of data.documents) out[doc.name.split("/").pop()] = fsToObj(doc);
+  return out;
+}
+ 
+async function fsSet(env, path, obj) {
+  const fields = objToFs(obj).mapValue?.fields || {};
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${path}?key=${env.FIREBASE_API_KEY}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields })
+    }
+  );
+  return res.ok;
+}
+ 
+async function sendSMS(env, phone, message) {
+  const cleanPhone = phone.replace(/\D/g, "");
+  if (cleanPhone.length < 10) return { success: false, error: "Invalid phone" };
+ 
+  try {
+    const tbRes = await fetch("https://textbelt.com/text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone: cleanPhone, message, key: env.TEXTBELT_KEY })
+    });
+    const tbData = await tbRes.json();
+    if (tbData.success) return { success: true, quota: tbData.quotaRemaining, provider: "textbelt" };
+    return { success: false, error: tbData.error||"Textbelt failed", quota: tbData.quotaRemaining, provider: "textbelt" };
+  } catch(e) {
+    return { success: false, error: e.message, provider: "textbelt" };
+  }
+}
+ 
+async function callSharkey(env, prompt) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 300, messages: [{ role: "user", content: prompt }] })
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return (data.content?.[0]?.text||"").replace(/\n/g," ").trim();
+}
