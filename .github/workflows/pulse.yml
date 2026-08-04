@@ -2,38 +2,35 @@ name: Sharkey Pulse
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 10 * * *'    # 6AM EDT — Morning Briefing
-    - cron: '0 13 * * *'    # 9AM EDT — Alert check
-    - cron: '0 15 * * *'    # 11AM EDT — Alert check
-    - cron: '0 17 * * *'    # 1PM EDT — Alert check
-    - cron: '0 19 * * *'    # 3PM EDT — Alert check
-    - cron: '0 21 * * *'    # 5PM EDT — Alert check
-    - cron: '0 23 * * *'    # 7PM EDT — Alert check
-    - cron: '0 2 * * *'     # 10PM EDT — Nightly Recap
-
+    - cron: '7 10 * * *'    # ~6:07AM EDT — Morning Briefing
+    - cron: '7 13 * * *'    # ~9:07AM EDT — Alert check
+    - cron: '7 15 * * *'    # ~11:07AM EDT — Alert check
+    - cron: '7 17 * * *'    # ~1:07PM EDT — Alert check
+    - cron: '7 19 * * *'    # ~3:07PM EDT — Alert check
+    - cron: '7 21 * * *'    # ~5:07PM EDT — Alert check
+    - cron: '7 23 * * *'    # ~7:07PM EDT — Alert check
+    - cron: '7 2 * * *'     # ~10:07PM EDT — Nightly Recap
 jobs:
   briefing:
-    if: github.event.schedule == '0 10 * * *' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '7 10 * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Morning Briefing
         run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=briefing"
-
   alert:
     if: >
-      github.event.schedule == '0 13 * * *' ||
-      github.event.schedule == '0 15 * * *' ||
-      github.event.schedule == '0 17 * * *' ||
-      github.event.schedule == '0 19 * * *' ||
-      github.event.schedule == '0 21 * * *' ||
-      github.event.schedule == '0 23 * * *'
+      github.event.schedule == '7 13 * * *' ||
+      github.event.schedule == '7 15 * * *' ||
+      github.event.schedule == '7 17 * * *' ||
+      github.event.schedule == '7 19 * * *' ||
+      github.event.schedule == '7 21 * * *' ||
+      github.event.schedule == '7 23 * * *'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Alert Check
         run: curl -s "https://execucore-pulse.wsharkey.workers.dev/?type=alert"
-
   recap:
-    if: github.event.schedule == '0 2 * * *'
+    if: github.event.schedule == '7 2 * * *'
     runs-on: ubuntu-latest
     steps:
       - name: Fire Nightly Recap
